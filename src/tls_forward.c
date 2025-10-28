@@ -16,8 +16,10 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#include "cache_lru.h"   // <-- LRU cache header
-#include "filter.h"     // <-- Filter header
+#include "cache_lru.h"
+#include "filter.h"
+#include "logger.h"
+
 static FilterList filters;
 
 #define LISTEN_PORT 4433
@@ -31,6 +33,21 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
 /* -------------------- Networking helpers -------------------- */
+
+static void get_client_addr_str(struct sockaddr_storage* cli, char* ipbuf, size_t iplen, int* port) {
+    if (cli->ss_family == AF_INET) {
+        struct sockaddr_in* s = (struct sockaddr_in*)cli;
+        inet_ntop(AF_INET, &s->sin_addr, ipbuf, iplen);
+        *port = ntohs(s->sin_port);
+    } else if (cli->ss_family == AF_INET6) {
+        struct sockaddr_in6* s = (struct sockaddr_in6*)cli;
+        inet_ntop(AF_INET6, &s->sin6_addr, ipbuf, iplen);
+        *port = ntohs(s->sin6_port);
+    } else {
+        snprintf(ipbuf, iplen, "unknown");
+        *port = 0;
+    }
+}
 
 static int connect_tcp(const char* host, int port) {
     int fd = -1;
@@ -174,9 +191,10 @@ static int read_full_http_request_from_client(SSL* ssl, unsigned char** out_buf,
     }
 }
 
-/* -------------------- Proxy core with caching -------------------- */
+/* -------------------- Proxy core with caching + logging -------------------- */
 
-static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
+static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
+                                      const char* client_ip, int client_port) {
     // Step 1: Read request from client
     unsigned char* req = NULL; size_t req_len = 0;
     if (read_full_http_request_from_client(ssl_client, &req, &req_len) != 0) {
@@ -193,23 +211,8 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
     // Build cache key as "METHOD URL"
     char key[2048];
     snprintf(key, sizeof(key), "%s %s", method, url);
-    fprintf(stderr, "[DEBUG] Key built = %s\n", key);
 
-    // Only cache GET requests
-    if (strcmp(method, "GET") == 0) {
-        size_t cached_len = 0;
-        unsigned char* cached_val = lru_get(cache, key, &cached_len);
-        if (cached_val) {
-            // Cache HIT
-            fprintf(stderr, "[CACHE HIT] %s\n", key);
-            fprintf(stderr, "[DEBUG] Cache hit length = %zu\n", cached_len);
-            SSL_write(ssl_client, cached_val, (int)cached_len);
-            free(req);
-            return 0;
-        }
-    }
-
-    // Step 2.5: Apply filtering rules (URL and headers)
+    // Step 2.5: Apply filtering rules
     if (filter_match(&filters, (char*)req)) {
         const char* resp =
             "HTTP/1.1 403 Forbidden\r\n"
@@ -219,12 +222,24 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
             "\r\n"
             "Access denied\n";
         SSL_write(ssl_client, resp, (int)strlen(resp));
-        fprintf(stderr, "[FILTER BLOCKED] %s\n", key);
+        log_json(client_ip, client_port, method, url, "FILTER_BLOCKED", 403, strlen(resp));
         free(req);
         return 0;
     }
 
-    // Step 3: Forward request to backend
+    // Cache HIT
+    if (strcmp(method, "GET") == 0) {
+        size_t cached_len = 0;
+        unsigned char* cached_val = lru_get(cache, key, &cached_len);
+        if (cached_val) {
+            SSL_write(ssl_client, cached_val, (int)cached_len);
+            log_json(client_ip, client_port, method, url, "CACHE_HIT", 200, cached_len);
+            free(req);
+            return 0;
+        }
+    }
+
+    // Step 3: Forward to backend
     int bfd = connect_tcp(BACKEND_HOST, BACKEND_PORT);
     if (bfd < 0) {
         free(req);
@@ -236,6 +251,7 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
             "\r\n"
             "Bad Gateway.\n";
         SSL_write(ssl_client, resp, (int)strlen(resp));
+        log_json(client_ip, client_port, method, url, "ERROR", 502, strlen(resp));
         return -1;
     }
 
@@ -247,7 +263,7 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
     }
     free(req);
 
-    // Collect full response from backend
+    // Collect full response
     unsigned char* resp_buf = NULL;
     size_t resp_cap = 16 * 1024, resp_len = 0;
     resp_buf = malloc(resp_cap);
@@ -268,14 +284,13 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
     }
     close(bfd);
 
-    // Step 4: Send response to client
     SSL_write(ssl_client, resp_buf, (int)resp_len);
 
-    // Step 5: Store in cache if GET
     if (strcmp(method, "GET") == 0) {
         lru_put(cache, key, resp_buf, resp_len);
-        fprintf(stderr, "[CACHE STORE] %s (len=%zu)\n", key, resp_len);
-        fprintf(stderr, "[DEBUG] Stored response length = %zu\n", resp_len);
+        log_json(client_ip, client_port, method, url, "CACHE_STORE", 200, resp_len);
+    } else {
+        log_json(client_ip, client_port, method, url, "FORWARD", 200, resp_len);
     }
 
     free(resp_buf);
@@ -291,13 +306,11 @@ int main(void) {
     int lfd = make_listen_socket();
     SSL_CTX *ctx = make_server_ctx("certs/server.crt", "certs/server.key");
 
-    // Initialize cache with capacity = 100 entries
     LRUCache* cache = lru_create(100);
 
-    // Example filter patterns and initialization
     const char* patterns[] = {
-    "/admin",              // block URLs containing "/admin"
-    "User-Agent: curl"     // block headers containing "curl"
+        "/admin",
+        "User-Agent: curl"
     };
     filter_init(&filters, patterns, 2);
 
@@ -313,6 +326,9 @@ int main(void) {
             perror("accept"); continue;
         }
 
+        char ipbuf[64]; int port = 0;
+        get_client_addr_str(&cli, ipbuf, sizeof(ipbuf), &port);
+
         SSL *ssl = SSL_new(ctx);
         if (!ssl) { ERR_print_errors_fp(stderr); close(cfd); continue; }
         SSL_set_fd(ssl, cfd);
@@ -322,7 +338,7 @@ int main(void) {
             SSL_free(ssl); close(cfd); continue;
         }
 
-        (void)forward_request_with_cache(ssl, cache);
+        (void)forward_request_with_cache(ssl, cache, ipbuf, port);
 
         SSL_shutdown(ssl);
         SSL_free(ssl);
