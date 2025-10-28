@@ -2,12 +2,13 @@ CC=gcc
 CFLAGS=-O2 -Wall -Wextra -Wpedantic
 LDFLAGS=-lssl -lcrypto
 
-BIN=tls_hello
+BIN=tls_forward
+SRC=src/tls_forward.c src/cache_lru.c
 
 all: $(BIN)
 
-$(BIN): src/tls_hello.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+$(BIN): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
 
 clean:
 	rm -f $(BIN)

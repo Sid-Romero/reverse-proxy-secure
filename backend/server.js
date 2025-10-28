@@ -1,6 +1,8 @@
 const http = require('http');
 
 const server = http.createServer((req, res) => {
+  console.log("Backend got:", req.method, req.url);   // <-- log the request method and URL
+
   let body = [];
   req.on('data', chunk => body.push(chunk));
   req.on('end', () => {
