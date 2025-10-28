@@ -3,7 +3,7 @@ CFLAGS=-O2 -Wall -Wextra -Wpedantic
 LDFLAGS=-lssl -lcrypto
 
 BIN=tls_forward
-SRC=src/tls_forward.c src/cache_lru.c
+SRC=src/tls_forward.c src/cache_lru.c src/filter.c
 
 all: $(BIN)
 

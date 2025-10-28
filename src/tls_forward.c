@@ -17,6 +17,8 @@
 #include <openssl/err.h>
 
 #include "cache_lru.h"   // <-- LRU cache header
+#include "filter.h"     // <-- Filter header
+static FilterList filters;
 
 #define LISTEN_PORT 4433
 #define BACKLOG 128
@@ -207,6 +209,21 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache) {
         }
     }
 
+    // Step 2.5: Apply filtering rules (URL and headers)
+    if (filter_match(&filters, (char*)req)) {
+        const char* resp =
+            "HTTP/1.1 403 Forbidden\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 13\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Access denied\n";
+        SSL_write(ssl_client, resp, (int)strlen(resp));
+        fprintf(stderr, "[FILTER BLOCKED] %s\n", key);
+        free(req);
+        return 0;
+    }
+
     // Step 3: Forward request to backend
     int bfd = connect_tcp(BACKEND_HOST, BACKEND_PORT);
     if (bfd < 0) {
@@ -277,6 +294,13 @@ int main(void) {
     // Initialize cache with capacity = 100 entries
     LRUCache* cache = lru_create(100);
 
+    // Example filter patterns and initialization
+    const char* patterns[] = {
+    "/admin",              // block URLs containing "/admin"
+    "User-Agent: curl"     // block headers containing "curl"
+    };
+    filter_init(&filters, patterns, 2);
+
     fprintf(stderr, "[*] TLS reverse proxy listening on 0.0.0.0:%d → %s:%d\n",
             LISTEN_PORT, BACKEND_HOST, BACKEND_PORT);
     fprintf(stderr, "[*] Ctrl+C to stop\n");
@@ -306,6 +330,7 @@ int main(void) {
     }
 
     lru_free(cache);
+    filter_free(&filters);
     SSL_CTX_free(ctx);
     close(lfd);
     EVP_cleanup();
