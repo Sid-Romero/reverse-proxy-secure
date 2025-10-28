@@ -15,6 +15,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <uuid/uuid.h>  // pour X-Request-ID
 
 #include "cache_lru.h"
 #include "filter.h"
@@ -32,8 +33,7 @@ static FilterList filters;
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
-/* -------------------- Networking helpers -------------------- */
-
+/* ---------------- Helpers réseau ---------------- */
 static void get_client_addr_str(struct sockaddr_storage* cli, char* ipbuf, size_t iplen, int* port) {
     if (cli->ss_family == AF_INET) {
         struct sockaddr_in* s = (struct sockaddr_in*)cli;
@@ -126,8 +126,7 @@ static SSL_CTX* make_server_ctx(const char* cert_path, const char* key_path) {
     return ctx;
 }
 
-/* -------------------- HTTP request reader -------------------- */
-
+/* ---------------- Helpers HTTP ---------------- */
 static long parse_content_length(const char* headers, size_t len) {
     const char* p = headers;
     const char* end = headers + len;
@@ -191,29 +190,32 @@ static int read_full_http_request_from_client(SSL* ssl, unsigned char** out_buf,
     }
 }
 
-/* -------------------- Proxy core with caching + logging -------------------- */
+static void generate_request_id(char* buf, size_t buflen) {
+    uuid_t uuid;
+    uuid_generate(uuid);
+    if (buflen >= 37) {
+        uuid_unparse_lower(uuid, buf);
+    } else if (buflen > 0) {
+        buf[0] = '\0';
+    }
+}
 
+/* ---------------- Proxy core ---------------- */
 static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
                                       const char* client_ip, int client_port) {
-    // Step 1: Read request from client
     unsigned char* req = NULL; size_t req_len = 0;
     if (read_full_http_request_from_client(ssl_client, &req, &req_len) != 0) {
         return -1;
     }
 
-    // Step 2: Extract method and URL from request line
     char method[8], url[1024];
     if (sscanf((char*)req, "%7s %1023s", method, url) != 2) {
         free(req);
         return -1;
     }
 
-    // Build cache key as "METHOD URL"
-    char key[2048];
-    snprintf(key, sizeof(key), "%s %s", method, url);
-
-    // Step 2.5: Apply filtering rules
-    if (filter_match(&filters, (char*)req)) {
+    /* Filtrage sur URL */
+    if (filter_match(&filters, url)) {
         const char* resp =
             "HTTP/1.1 403 Forbidden\r\n"
             "Content-Type: text/plain; charset=utf-8\r\n"
@@ -227,7 +229,25 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
         return 0;
     }
 
-    // Cache HIT
+    /* Filtrage sur headers */
+    char* headers_start = strstr((char*)req, "\r\n");
+    if (headers_start && filter_match(&filters, headers_start+2)) {
+        const char* resp =
+            "HTTP/1.1 403 Forbidden\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 13\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Access denied\n";
+        SSL_write(ssl_client, resp, (int)strlen(resp));
+        log_json(client_ip, client_port, method, url, "FILTER_BLOCKED", 403, strlen(resp));
+        free(req);
+        return 0;
+    }
+
+    /* Cache HIT */
+    char key[2048];
+    snprintf(key, sizeof(key), "%s %s", method, url);
     if (strcmp(method, "GET") == 0) {
         size_t cached_len = 0;
         unsigned char* cached_val = lru_get(cache, key, &cached_len);
@@ -239,7 +259,7 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
         }
     }
 
-    // Step 3: Forward to backend
+    /* Connexion backend */
     int bfd = connect_tcp(BACKEND_HOST, BACKEND_PORT);
     if (bfd < 0) {
         free(req);
@@ -255,15 +275,43 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
         return -1;
     }
 
+    /* Ajout headers tracing */
+    char request_id[64];
+    generate_request_id(request_id, sizeof(request_id));
+
+    const char* end_marker = "\r\n\r\n";
+    char* header_end = strstr((char*)req, end_marker);
+    if (!header_end) { close(bfd); free(req); return -1; }
+
+    size_t head_len = (size_t)(header_end - (char*)req);
+    size_t body_off = head_len + 4;
+    size_t body_len = req_len - body_off;
+
+    char extra_headers[512];
+    int eh = snprintf(extra_headers, sizeof(extra_headers),
+                      "X-Forwarded-For: %s\r\n"
+                      "X-Forwarded-Proto: https\r\n"
+                      "X-Request-ID: %s\r\n",
+                      client_ip, request_id);
+
+    size_t new_len = head_len + (size_t)eh + 4 + body_len;
+    unsigned char* new_req = malloc(new_len);
+
+    memcpy(new_req, req, head_len);
+    memcpy(new_req + head_len, extra_headers, (size_t)eh);
+    memcpy(new_req + head_len + (size_t)eh, end_marker, 4);
+    memcpy(new_req + head_len + (size_t)eh + 4, req + body_off, body_len);
+
     size_t off = 0;
-    while (off < req_len) {
-        ssize_t wn = send(bfd, req + off, req_len - off, 0);
-        if (wn < 0) { close(bfd); free(req); return -1; }
+    while (off < new_len) {
+        ssize_t wn = send(bfd, new_req + off, new_len - off, 0);
+        if (wn < 0) { close(bfd); free(req); free(new_req); return -1; }
         off += (size_t)wn;
     }
     free(req);
+    free(new_req);
 
-    // Collect full response
+    /* Lire réponse backend */
     unsigned char* resp_buf = NULL;
     size_t resp_cap = 16 * 1024, resp_len = 0;
     resp_buf = malloc(resp_cap);
@@ -273,32 +321,56 @@ static int forward_request_with_cache(SSL* ssl_client, LRUCache* cache,
         ssize_t rn = recv(bfd, tmp, sizeof(tmp), 0);
         if (rn == 0) break;
         if (rn < 0) { free(resp_buf); close(bfd); return -1; }
-        if (resp_len + rn > resp_cap) {
+        if (resp_len + (size_t)rn > resp_cap) {
             resp_cap *= 2;
             unsigned char* tmp2 = realloc(resp_buf, resp_cap);
             if (!tmp2) { free(resp_buf); close(bfd); return -1; }
             resp_buf = tmp2;
         }
-        memcpy(resp_buf + resp_len, tmp, rn);
-        resp_len += rn;
+        memcpy(resp_buf + resp_len, tmp, (size_t)rn);
+        resp_len += (size_t)rn;
     }
     close(bfd);
 
-    SSL_write(ssl_client, resp_buf, (int)resp_len);
+    /* Ajouter headers sécurité */
+    char* resp_header_end = strstr((char*)resp_buf, end_marker);
+    const char* sec_headers =
+        "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n";
 
-    if (strcmp(method, "GET") == 0) {
-        lru_put(cache, key, resp_buf, resp_len);
-        log_json(client_ip, client_port, method, url, "CACHE_STORE", 200, resp_len);
+    if (resp_header_end) {
+        size_t hlen = (size_t)(resp_header_end - (char*)resp_buf);
+        size_t body_off2 = hlen + 4;
+        size_t body_len2 = resp_len - body_off2;
+        size_t sh_len = strlen(sec_headers);
+
+        size_t new_resp_len = hlen + sh_len + 4 + body_len2;
+        unsigned char* new_resp = malloc(new_resp_len);
+
+        memcpy(new_resp, resp_buf, hlen);
+        memcpy(new_resp + hlen, sec_headers, sh_len);
+        memcpy(new_resp + hlen + sh_len, end_marker, 4);
+        memcpy(new_resp + hlen + sh_len + 4, resp_buf + body_off2, body_len2);
+
+        SSL_write(ssl_client, new_resp, (int)new_resp_len);
+        if (strcmp(method, "GET") == 0) {
+            lru_put(cache, key, new_resp, new_resp_len);
+            log_json(client_ip, client_port, method, url, "CACHE_STORE", 200, new_resp_len);
+        } else {
+            log_json(client_ip, client_port, method, url, "FORWARD", 200, new_resp_len);
+        }
+        free(new_resp);
+        free(resp_buf);
+        return 0;
     } else {
-        log_json(client_ip, client_port, method, url, "FORWARD", 200, resp_len);
+        SSL_write(ssl_client, resp_buf, (int)resp_len);
+        free(resp_buf);
+        return 0;
     }
-
-    free(resp_buf);
-    return 0;
 }
 
-/* -------------------- Main -------------------- */
-
+/* ---------------- Main ---------------- */
 int main(void) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -309,14 +381,13 @@ int main(void) {
     LRUCache* cache = lru_create(100);
 
     const char* patterns[] = {
-        "/admin",
-        "User-Agent: curl"
+        "^/admin", // bloquer URL commençant par /admin
+        "sqlmap"   // bloquer UA ou header contenant sqlmap
     };
     filter_init(&filters, patterns, 2);
 
     fprintf(stderr, "[*] TLS reverse proxy listening on 0.0.0.0:%d → %s:%d\n",
             LISTEN_PORT, BACKEND_HOST, BACKEND_PORT);
-    fprintf(stderr, "[*] Ctrl+C to stop\n");
 
     while (!g_stop) {
         struct sockaddr_storage cli; socklen_t clilen = sizeof(cli);
