@@ -5,21 +5,54 @@ services:
     build:
       context: ./backend
     container_name: backend
-    # ports:
-    #   - "8080:8080"
-    networks:
-      - appnet
+    networks: [appnet]
 
   proxy:
     build:
       context: .
     container_name: proxy
-    depends_on:
-      - backend
+    depends_on: [backend]
     ports:
       - "4433:4433"
-    networks:
-      - appnet
+    networks: [appnet]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    networks: [appnet]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks: [appnet]
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.0
+    container_name: filebeat
+    user: root
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+    depends_on:
+      - elasticsearch
+    networks: [appnet]
 
 networks:
   appnet:
