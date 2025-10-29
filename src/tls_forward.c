@@ -27,7 +27,7 @@ static FilterList filters;
 #define BACKLOG 128
 #define RECV_BUF 8192
 
-#define BACKEND_HOST "127.0.0.1"
+#define BACKEND_HOST "backend"
 #define BACKEND_PORT 8080
 
 static volatile sig_atomic_t g_stop = 0;

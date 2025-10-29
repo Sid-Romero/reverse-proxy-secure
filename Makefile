@@ -11,3 +11,16 @@ $(BIN): $(SRC)
 
 clean:
 	rm -f $(BIN)
+
+# ---- Docker targets ----
+docker-build:
+	docker build -t reverse-proxy-secure .
+
+docker-run:
+	docker run --rm -p 4433:4433 reverse-proxy-secure
+
+compose-up:
+	docker compose up --build
+
+compose-down:
+	docker compose down

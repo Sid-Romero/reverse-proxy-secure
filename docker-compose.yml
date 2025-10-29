@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: backend
+    # ports:
+    #   - "8080:8080"
+    networks:
+      - appnet
+
+  proxy:
+    build:
+      context: .
+    container_name: proxy
+    depends_on:
+      - backend
+    ports:
+      - "4433:4433"
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    driver: bridge
